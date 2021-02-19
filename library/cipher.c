@@ -694,6 +694,7 @@ int mbedtls_cipher_update( mbedtls_cipher_context_t *ctx, const unsigned char *i
 
 #if defined(MBEDTLS_CIPHER_MODE_CTR)
     if( ctx->cipher_info->mode == MBEDTLS_MODE_CTR )
+#if !defined(FSP_CTR_ALT)
     {
         if( 0 != ( ret = ctx->cipher_info->base->ctr_func( ctx->cipher_ctx,
                 ilen, &ctx->unprocessed_len, ctx->iv,
@@ -706,6 +707,77 @@ int mbedtls_cipher_update( mbedtls_cipher_context_t *ctx, const unsigned char *i
 
         return( 0 );
     }
+#else
+    {
+        size_t copy_len = 0;
+
+        /*
+         * If there is not enough data for a full block, cache it.
+         */
+        if( ilen < ( block_size - ctx->unprocessed_len ) )
+        {
+            memcpy( &( ctx->unprocessed_data[ctx->unprocessed_len] ), input,
+                    ilen );
+
+            ctx->unprocessed_len += ilen;
+            return( 0 );
+        }
+
+        /*
+         * Process cached data first
+         */
+        if( 0 != ctx->unprocessed_len )
+        {
+            copy_len = block_size - ctx->unprocessed_len;
+
+            memcpy( &( ctx->unprocessed_data[ctx->unprocessed_len] ), input,
+                    copy_len );
+
+            if( 0 != ( ret = ctx->cipher_info->base->ctr_func( ctx->cipher_ctx,
+                                                               block_size, NULL, ctx->iv,
+                                                               NULL, ctx->unprocessed_data, output ) ) )
+            {
+                return( ret );
+            }
+
+            *olen += block_size;
+            output += block_size;
+            ctx->unprocessed_len = 0;
+
+            input += copy_len;
+            ilen -= copy_len;
+        }
+
+        /*
+         * Cache final, incomplete block
+         */
+        if( 0 != ilen )
+        {
+            copy_len = ilen % block_size;
+            memcpy( ctx->unprocessed_data, &( input[ilen - copy_len] ),
+                    copy_len );
+
+            ctx->unprocessed_len += copy_len;
+            ilen -= copy_len;
+        }
+
+        /*
+         * Process remaining full blocks
+         */
+        if( ilen )
+        {
+            if( 0 != ( ret = ctx->cipher_info->base->ctr_func( ctx->cipher_ctx,
+                    ilen, NULL, ctx->iv, NULL, input, output ) ) )
+            {
+                return( ret );
+            }
+
+            *olen += ilen;
+        }
+
+        return( 0 );
+    }
+#endif /* FSP_CTR_ALT */
 #endif /* MBEDTLS_CIPHER_MODE_CTR */
 
 #if defined(MBEDTLS_CIPHER_MODE_XTS)
@@ -921,6 +993,7 @@ static int get_no_padding( unsigned char *input, size_t input_len,
 
 int mbedtls_cipher_finish( mbedtls_cipher_context_t *ctx,
                    unsigned char *output, size_t *olen )
+#if !defined(FSP_CTR_ALT)
 {
     CIPHER_VALIDATE_RET( ctx != NULL );
     CIPHER_VALIDATE_RET( output != NULL );
@@ -1018,6 +1091,130 @@ int mbedtls_cipher_finish( mbedtls_cipher_context_t *ctx,
 
     return( MBEDTLS_ERR_CIPHER_FEATURE_UNAVAILABLE );
 }
+#else
+{
+    CIPHER_VALIDATE_RET( ctx != NULL );
+    CIPHER_VALIDATE_RET( output != NULL );
+    CIPHER_VALIDATE_RET( olen != NULL );
+    if( ctx->cipher_info == NULL )
+        return( MBEDTLS_ERR_CIPHER_BAD_INPUT_DATA );
+
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+    if( ctx->psa_enabled == 1 )
+    {
+        /* While PSA Crypto has an API for multipart
+         * operations, we currently don't make it
+         * accessible through the cipher layer. */
+        return( MBEDTLS_ERR_CIPHER_FEATURE_UNAVAILABLE );
+    }
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+
+    *olen = 0;
+
+    if( MBEDTLS_MODE_CFB == ctx->cipher_info->mode ||
+        MBEDTLS_MODE_OFB == ctx->cipher_info->mode ||
+        MBEDTLS_MODE_GCM == ctx->cipher_info->mode ||
+        MBEDTLS_MODE_XTS == ctx->cipher_info->mode ||
+        MBEDTLS_MODE_STREAM == ctx->cipher_info->mode )
+    {
+        return( 0 );
+    }
+
+    if ( ( MBEDTLS_CIPHER_CHACHA20          == ctx->cipher_info->type ) ||
+         ( MBEDTLS_CIPHER_CHACHA20_POLY1305 == ctx->cipher_info->type ) )
+    {
+        return( 0 );
+    }
+
+    if( MBEDTLS_MODE_ECB == ctx->cipher_info->mode )
+    {
+        if( ctx->unprocessed_len != 0 )
+            return( MBEDTLS_ERR_CIPHER_FULL_BLOCK_EXPECTED );
+
+        return( 0 );
+    }
+
+#if defined(MBEDTLS_CIPHER_MODE_CBC)
+    if( MBEDTLS_MODE_CBC == ctx->cipher_info->mode )
+    {
+        int ret = 0;
+
+        if( MBEDTLS_ENCRYPT == ctx->operation )
+        {
+            /* check for 'no padding' mode */
+            if( NULL == ctx->add_padding )
+            {
+                if( 0 != ctx->unprocessed_len )
+                    return( MBEDTLS_ERR_CIPHER_FULL_BLOCK_EXPECTED );
+
+                return( 0 );
+            }
+
+            ctx->add_padding( ctx->unprocessed_data, mbedtls_cipher_get_iv_size( ctx ),
+                    ctx->unprocessed_len );
+        }
+        else if( mbedtls_cipher_get_block_size( ctx ) != ctx->unprocessed_len )
+        {
+            /*
+             * For decrypt operations, expect a full block,
+             * or an empty block if no padding
+             */
+            if( NULL == ctx->add_padding && 0 == ctx->unprocessed_len )
+                return( 0 );
+
+            return( MBEDTLS_ERR_CIPHER_FULL_BLOCK_EXPECTED );
+        }
+
+        /* cipher block */
+        if( 0 != ( ret = ctx->cipher_info->base->cbc_func( ctx->cipher_ctx,
+                ctx->operation, mbedtls_cipher_get_block_size( ctx ), ctx->iv,
+                ctx->unprocessed_data, output ) ) )
+        {
+            return( ret );
+        }
+
+        /* Set output size for decryption */
+        if( MBEDTLS_DECRYPT == ctx->operation )
+            return( ctx->get_padding( output, mbedtls_cipher_get_block_size( ctx ),
+                                      olen ) );
+
+        /* Set output size for encryption */
+        *olen = mbedtls_cipher_get_block_size( ctx );
+        return( 0 );
+    }
+#endif
+#if defined(MBEDTLS_CIPHER_MODE_CTR)
+    if( MBEDTLS_MODE_CTR == ctx->cipher_info->mode )
+    {
+        int ret = 0;
+        unsigned char tmp[16];
+        unsigned int block_size = mbedtls_cipher_get_block_size( ctx );
+
+        if( 0 != ctx->unprocessed_len )
+        {
+            memset( &( ctx->unprocessed_data[ctx->unprocessed_len] ), 0,
+                    (block_size - ctx->unprocessed_len) );
+            /* cipher block */
+            if( 0 != ( ret = ctx->cipher_info->base->ctr_func( ctx->cipher_ctx, block_size,
+                                                               NULL, ctx->iv, NULL,
+                                                               ctx->unprocessed_data, tmp ) ) )
+            {
+                return( ret );
+            }
+
+            memcpy(output, tmp, ctx->unprocessed_len);
+            *olen = ctx->unprocessed_len;
+        }
+
+        return( 0 );
+    }
+#else
+    ((void) output);
+#endif /* MBEDTLS_CIPHER_MODE_CBC */
+
+    return( MBEDTLS_ERR_CIPHER_FEATURE_UNAVAILABLE );
+}
+#endif /* FSP_CTR_ALT */
 
 #if defined(MBEDTLS_CIPHER_MODE_WITH_PADDING)
 int mbedtls_cipher_set_padding_mode( mbedtls_cipher_context_t *ctx,
