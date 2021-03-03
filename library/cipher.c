@@ -29,7 +29,7 @@
 #include MBEDTLS_CONFIG_FILE
 #endif
 
-#if defined(MBEDTLS_CIPHER_C)
+#if defined(MBEDTLS_CIPHER_C) && !defined(MBEDTLS_CIPHER_ALT)
 
 #include "mbedtls/cipher.h"
 #include "mbedtls/cipher_internal.h"
